@@ -25,6 +25,53 @@ try:
 except ImportError:
     DATASETS_AVAILABLE = False
 
+try:
+    from transformers import AutoTokenizer
+    TOKENIZER_AVAILABLE = True
+except ImportError:
+    TOKENIZER_AVAILABLE = False
+
+# Global tokenizer - initialize once
+tokenizer = None
+
+def initialize_tokenizer():
+    """Initialize the tokenizer for input token counting"""
+    global tokenizer
+    if not TOKENIZER_AVAILABLE:
+        print("⚠️  transformers library not available. Install with: pip install transformers")
+        print("   Input token counting will be disabled.")
+        return None
+    
+    try:
+        print("🔤 Loading Qwen2.5-72B tokenizer for input token counting...")
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-72B-Instruct-AWQ")
+        print("✅ Tokenizer loaded successfully")
+        return tokenizer
+    except Exception as e:
+        print(f"❌ Failed to load tokenizer: {e}")
+        print("   Input token counting will be disabled.")
+        return None
+
+def count_input_tokens(prompt: str) -> int:
+    """Count input tokens for a prompt"""
+    if tokenizer is None:
+        return 0
+    
+    try:
+        # Format the prompt as it would be sent to the model
+        messages = [{"role": "user", "content": prompt}]
+        # Apply chat template if available
+        if hasattr(tokenizer, 'apply_chat_template'):
+            formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            formatted_prompt = prompt
+        
+        tokens = tokenizer.encode(formatted_prompt)
+        return len(tokens)
+    except Exception as e:
+        print(f"Warning: Failed to count tokens for request: {e}")
+        return 0
+
 def load_realistic_prompts(dataset_name: str = "databricks/databricks-dolly-15k", max_prompts: int = 100):
     """Load diverse prompts from Hugging Face dataset"""
     if not DATASETS_AVAILABLE:
@@ -70,10 +117,16 @@ async def chat_integration(prompt: str, client: AsyncOpenAI, tokens_per_second: 
 		print(f"\n--- Request {request_id} ---")
 		print(f"Prompt length: {len(prompt)} chars")
 	
+	# Count input tokens
+	input_tokens = count_input_tokens(prompt)
+	if request_id is not None and input_tokens > 0:
+		print(f"Input tokens: {input_tokens}")
+	
 	start_time = time.time()
 	first_token_time = None
 	previous_token_time = None
 	inter_token_latencies = []
+	output_tokens = 0
 	
 	stream = await client.chat.completions.create(
 	    messages=[
@@ -108,21 +161,30 @@ async def chat_integration(prompt: str, client: AsyncOpenAI, tokens_per_second: 
 			second_key = int(current_time)
 			
 			if chunk.choices[0].delta.content:
+				output_tokens += 1
 				tokens_per_second[second_key] += 1  # Each chunk = 1 token
 				requests_active_per_second[second_key].add(request_id)
 			
-			#print(chunk.choices[0].delta.content, end="", flush=True)
-	#print()
+			# Only print tokens for single requests (when request_id is None)
+			if request_id is None:
+				print(chunk.choices[0].delta.content, end="", flush=True)
 	
 	if request_id is not None:
 		ttft = first_token_time - start_time if first_token_time else None
+		total_tokens = input_tokens + output_tokens
 		if ttft:
-			print(f"--- End Request {request_id} (TTFT: {ttft:.3f}s, Tokens: {len(inter_token_latencies) + 1}) ---\n")
+			print(f"--- End Request {request_id} (TTFT: {ttft:.3f}s, In: {input_tokens}, Out: {output_tokens}, Total: {total_tokens}) ---\n")
 		else:
-			print(f"--- End Request {request_id} (No tokens received) ---\n")
-		return ttft, inter_token_latencies
+			print(f"--- End Request {request_id} (No tokens received, In: {input_tokens}) ---\n")
+		return ttft, inter_token_latencies, input_tokens, output_tokens
 	
-	return None, inter_token_latencies
+	# Only print newline for single requests
+	if request_id is None:
+		print()
+	
+	# Calculate TTFT for single requests too
+	ttft = first_token_time - start_time if first_token_time else None
+	return ttft, inter_token_latencies, input_tokens, output_tokens
 
 def analyze_throughput(tokens_per_second: dict, requests_active_per_second: dict):
 	"""Analyze throughput metrics from time-series data"""
@@ -189,7 +251,7 @@ def generate_unique_filename(port: int, extension: str = "png") -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"benchmark_port{port}_{timestamp}.{extension}"
 
-def plot_throughput_analysis(tokens_per_second: dict, requests_active_per_second: dict, port: int, ttft_times: list = None, save_path: str = None, num_requests: int = 0, dataset_used: bool = False, inter_token_latencies: list = None):
+def plot_throughput_analysis(tokens_per_second: dict, requests_active_per_second: dict, port: int, ttft_times: list = None, save_path: str = None, num_requests: int = 0, dataset_used: bool = False, inter_token_latencies: list = None, token_stats: dict = None):
     """Plot throughput and parallel request count over time"""
     if not PLOTTING_AVAILABLE:
         print("Matplotlib not available. Install with: pip install matplotlib")
@@ -279,12 +341,28 @@ def plot_throughput_analysis(tokens_per_second: dict, requests_active_per_second
         f"Max: {max_active}",
         f"Avg: {avg_active:.1f}",
         f"Total: {num_requests}",
+    ]
+    
+    # Add token statistics if available
+    if token_stats:
+        stats_lines.extend([
+            "",
+            "TOKEN STATISTICS",
+            "─" * 18,
+            f"Input: {token_stats['total_input']:,}",
+            f"Output: {token_stats['total_output']:,}",
+            f"Total: {token_stats['total_all']:,}",
+            f"Avg In/Req: {token_stats['avg_input_per_req']:.1f}",
+            f"Avg Out/Req: {token_stats['avg_output_per_req']:.1f}",
+        ])
+    
+    stats_lines.extend([
         "",
         "WORKLOAD",
         "─" * 18,
         f"Type: {workload_type}",
         f"Port: {port}",
-    ]
+    ])
     
     # Add TTFT statistics if available
     if ttft_times:
@@ -312,7 +390,7 @@ def plot_throughput_analysis(tokens_per_second: dict, requests_active_per_second
             f"Avg: {statistics.mean(inter_token_latencies)*1000:.1f}ms",
             f"Med: {statistics.median(inter_token_latencies)*1000:.1f}ms",
             f"P95: {sorted(inter_token_latencies)[int(0.95*len(inter_token_latencies))]*1000:.1f}ms",
-            f"Samples: {len(inter_token_latencies)}"
+            f"Measurements: {len(inter_token_latencies)}"
         ])
     
     # Position statistics text further right to avoid covering axis label
@@ -354,11 +432,47 @@ async def run_parallel_requests(prompts: list, single_prompt: str, client: Async
 	results = await asyncio.gather(*tasks)
 	ttft_times = [result[0] for result in results]
 	all_inter_token_latencies = [result[1] for result in results]
+	input_tokens_list = [result[2] for result in results]
+	output_tokens_list = [result[3] for result in results]
 	
 	# Flatten all inter-token latencies into a single list
 	all_inter_token_latencies_flat = []
 	for latencies in all_inter_token_latencies:
 		all_inter_token_latencies_flat.extend(latencies)
+	
+	# Calculate token statistics
+	total_input_tokens = sum(input_tokens_list)
+	total_output_tokens = sum(output_tokens_list)
+	total_all_tokens = total_input_tokens + total_output_tokens
+	
+	valid_requests = len([t for t in ttft_times if t is not None])
+	avg_input_per_req = total_input_tokens / valid_requests if valid_requests > 0 else 0
+	avg_output_per_req = total_output_tokens / valid_requests if valid_requests > 0 else 0
+	avg_total_per_req = total_all_tokens / valid_requests if valid_requests > 0 else 0
+	
+	token_stats = {
+		'total_input': total_input_tokens,
+		'total_output': total_output_tokens,
+		'total_all': total_all_tokens,
+		'avg_input_per_req': avg_input_per_req,
+		'avg_output_per_req': avg_output_per_req,
+		'avg_total_per_req': avg_total_per_req
+	}
+	
+	# Display token statistics
+	print("\n" + "="*60)
+	print("TOKEN STATISTICS")
+	print("="*60)
+	print(f"Total Input Tokens:     {total_input_tokens:,}")
+	print(f"Total Output Tokens:    {total_output_tokens:,}")
+	print(f"Total All Tokens:       {total_all_tokens:,}")
+	print(f"Average Input/Request:  {avg_input_per_req:.1f}")
+	print(f"Average Output/Request: {avg_output_per_req:.1f}")
+	print(f"Average Total/Request:  {avg_total_per_req:.1f}")
+	if total_all_tokens > 0:
+		input_ratio = (total_input_tokens / total_all_tokens) * 100
+		output_ratio = (total_output_tokens / total_all_tokens) * 100
+		print(f"Input/Output Ratio:     {input_ratio:.1f}% / {output_ratio:.1f}%")
 	
 	# Analyze TTFT statistics
 	valid_times = [t for t in ttft_times if t is not None]
@@ -402,18 +516,20 @@ async def run_parallel_requests(prompts: list, single_prompt: str, client: Async
 			if latencies:
 				request_itl_stats.append({
 					'request_id': i + 1,
-					'num_tokens': len(latencies) + 1,  # +1 for first token
+					'input_tokens': input_tokens_list[i],
+					'output_tokens': output_tokens_list[i],
+					'total_tokens': input_tokens_list[i] + output_tokens_list[i],
 					'avg_itl': statistics.mean(latencies) * 1000,  # Convert to ms
 					'min_itl': min(latencies) * 1000,
 					'max_itl': max(latencies) * 1000
 				})
 		
 		if request_itl_stats:
-			print(f"\nPer-Request ITL Summary (first 10 requests):")
-			print("Req ID | Tokens | Avg ITL | Min ITL | Max ITL")
-			print("-------|--------|---------|---------|--------")
+			print(f"\nPer-Request Summary (first 10 requests):")
+			print("Req ID | In Tok | Out Tok| Tot Tok| Avg ITL | Min ITL | Max ITL")
+			print("-------|--------|--------|--------|---------|---------|--------")
 			for stats in request_itl_stats[:10]:
-				print(f"  {stats['request_id']:4d} | {stats['num_tokens']:6d} | {stats['avg_itl']:6.1f}ms | {stats['min_itl']:6.1f}ms | {stats['max_itl']:6.1f}ms")
+				print(f"  {stats['request_id']:4d} | {stats['input_tokens']:6d} | {stats['output_tokens']:6d} | {stats['total_tokens']:6d} | {stats['avg_itl']:6.1f}ms | {stats['min_itl']:6.1f}ms | {stats['max_itl']:6.1f}ms")
 			
 			if len(request_itl_stats) > 10:
 				print(f"  ... ({len(request_itl_stats) - 10} more requests)")
@@ -473,7 +589,7 @@ async def run_parallel_requests(prompts: list, single_prompt: str, client: Async
 	
 	# Always generate plot for parallel requests (automatically save with unique name)
 	if num_requests > 1:
-		plot_path = plot_throughput_analysis(tokens_per_second, requests_active_per_second, port, ttft_times, save_plot, num_requests, bool(prompts), all_inter_token_latencies_flat)
+		plot_path = plot_throughput_analysis(tokens_per_second, requests_active_per_second, port, ttft_times, save_plot, num_requests, bool(prompts), all_inter_token_latencies_flat, token_stats)
 	
 	print("="*60)
 
@@ -487,6 +603,10 @@ if __name__ == "__main__":
 	parser.add_argument("--plot", action="store_true", help="Display a plot of throughput and parallel requests over time")
 	parser.add_argument("--save-plot", type=str, help="Save plot to specific file (e.g., 'results.png'). If not specified, auto-generates unique filename.")
 	args = parser.parse_args()
+
+	# Only initialize tokenizer for input token counting if running multiple requests
+	if args.num_parallel > 1:
+		initialize_tokenizer()
 
 	# Load prompts before starting experiment - DEFAULT BEHAVIOR
 	prompts = None
@@ -513,14 +633,42 @@ if __name__ == "__main__":
 			prompt = args.prompt
 		else:
 			prompt = get_prompt_for_request(prompts, 0, args.prompt)
-		ttft, inter_token_latencies = asyncio.run(chat_integration(prompt, client, defaultdict(int), defaultdict(set)))
+		
+		# Measure total time for throughput calculation
+		start_time = time.time()
+		ttft, inter_token_latencies, input_tokens, output_tokens = asyncio.run(chat_integration(prompt, client, defaultdict(int), defaultdict(set)))
+		end_time = time.time()
+		total_time = end_time - start_time
+		
+		# Display statistics for single request
+		total_tokens = input_tokens + output_tokens
+		
+		# Display TTFT and throughput
+		print("\n" + "="*60)
+		print("PERFORMANCE METRICS")
+		print("="*60)
+		if ttft is not None:
+			print(f"Time to First Token (TTFT): {ttft:.3f}s")
+		else:
+			print("Time to First Token (TTFT): No tokens received")
+		
+		print(f"Total Response Time:        {total_time:.3f}s")
+		
+		if output_tokens > 0 and total_time > 0:
+			throughput = output_tokens / total_time
+			print(f"Output Throughput:          {throughput:.1f} tokens/second")
+		
+		if total_tokens > 0:
+			print("\n" + "="*60)
+			print("TOKEN STATISTICS")
+			print("="*60)
+			print(f"Output tokens:  {output_tokens}")
 		
 		# Display inter-token latency statistics for single request
 		if inter_token_latencies:
 			print("\n" + "="*60)
 			print("INTER-TOKEN LATENCY STATISTICS")
 			print("="*60)
-			print(f"Total tokens: {len(inter_token_latencies) + 1}")
 			print(f"Inter-token measurements: {len(inter_token_latencies)}")
 			print(f"Minimum ITL: {min(inter_token_latencies)*1000:.1f}ms")
 			print(f"Maximum ITL: {max(inter_token_latencies)*1000:.1f}ms")
