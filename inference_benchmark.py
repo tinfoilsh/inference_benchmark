@@ -12,24 +12,44 @@ load_dotenv()
 from openai import AsyncOpenAI
 #from tinfoil import AsyncTinfoilAI
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    PLOTTING_AVAILABLE = True
-except ImportError:
-    PLOTTING_AVAILABLE = False
+# Make heavy imports lazy - only import when needed
+PLOTTING_AVAILABLE = False
+DATASETS_AVAILABLE = False
+TOKENIZER_AVAILABLE = False
 
-try:
-    from datasets import load_dataset
-    DATASETS_AVAILABLE = True
-except ImportError:
-    DATASETS_AVAILABLE = False
+def _lazy_import_plotting():
+    """Lazy import matplotlib only when needed"""
+    global PLOTTING_AVAILABLE
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        PLOTTING_AVAILABLE = True
+        return plt, mdates
+    except ImportError:
+        PLOTTING_AVAILABLE = False
+        return None, None
 
-try:
-    from transformers import AutoTokenizer
-    TOKENIZER_AVAILABLE = True
-except ImportError:
-    TOKENIZER_AVAILABLE = False
+def _lazy_import_datasets():
+    """Lazy import datasets only when needed"""
+    global DATASETS_AVAILABLE
+    try:
+        from datasets import load_dataset
+        DATASETS_AVAILABLE = True
+        return load_dataset
+    except ImportError:
+        DATASETS_AVAILABLE = False
+        return None
+
+def _lazy_import_tokenizer():
+    """Lazy import transformers only when needed"""
+    global TOKENIZER_AVAILABLE
+    try:
+        from transformers import AutoTokenizer
+        TOKENIZER_AVAILABLE = True
+        return AutoTokenizer
+    except ImportError:
+        TOKENIZER_AVAILABLE = False
+        return None
 
 # Global tokenizer - initialize once
 tokenizer = None
@@ -37,6 +57,7 @@ tokenizer = None
 def initialize_tokenizer():
     """Initialize the tokenizer for input token counting"""
     global tokenizer
+    AutoTokenizer = _lazy_import_tokenizer()
     if not TOKENIZER_AVAILABLE:
         print("⚠️  transformers library not available. Install with: pip install transformers")
         print("   Input token counting will be disabled.")
@@ -74,6 +95,7 @@ def count_input_tokens(prompt: str) -> int:
 
 def load_realistic_prompts(dataset_name: str = "databricks/databricks-dolly-15k", max_prompts: int = 100):
     """Load diverse prompts from Hugging Face dataset"""
+    load_dataset = _lazy_import_datasets()
     if not DATASETS_AVAILABLE:
         print("⚠️  datasets library not available. Install with: pip install datasets")
         return None
@@ -253,6 +275,7 @@ def generate_unique_filename(port: int, extension: str = "png") -> str:
 
 def plot_throughput_analysis(tokens_per_second: dict, requests_active_per_second: dict, port: int, ttft_times: list = None, save_path: str = None, num_requests: int = 0, dataset_used: bool = False, inter_token_latencies: list = None, token_stats: dict = None):
     """Plot throughput and parallel request count over time"""
+    plt, mdates = _lazy_import_plotting()
     if not PLOTTING_AVAILABLE:
         print("Matplotlib not available. Install with: pip install matplotlib")
         return
@@ -620,7 +643,7 @@ if __name__ == "__main__":
 			print("⚠️  Dataset loading failed, using fallback prompt")
 			use_single_prompt = True
 			args.prompt = "Write a comprehensive explanation of machine learning concepts including supervised learning, unsupervised learning, and deep learning with practical examples."
-	else:
+	elif args.num_parallel != 1:
 		print(f"📝 Using single custom prompt: '{args.prompt[:50]}...'")
 
 	# Create the client once
